@@ -1,0 +1,122 @@
+{
+  "name": "WF5 · Central Error Handler",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "9f78b790-3c97-4ace-95b4-b3dc1fceba82",
+      "name": "Tangkap Error Workflow"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst events = $input.all();\n\nreturn events.map(item => {\n  const data = item.json;\n  const execution = data.execution ?? {};\n  const workflow = data.workflow ?? {};\n  const trigger = data.trigger ?? {};\n\n  const workflowName = workflow.name ?? \"Tidak diketahui\";\n  const nodeName =\n    execution.lastNodeExecuted ??\n    trigger.error?.node?.name ??\n    \"Tidak diketahui\";\n\n  const errorMessage =\n    execution.error?.message ??\n    trigger.error?.message ??\n    \"Tidak ada detail error\";\n\n  const businessKey =\n    execution.error?.context?.business_key ??\n    data.business_key ??\n    \"Tidak tersedia\";\n\n  const occurredAt =\n    execution.startedAt ??\n    new Date().toISOString();\n\n  const message = [\n    \"🚨 H8MART — WORKFLOW ERROR\",\n    \"\",\n    `Workflow: ${workflowName}`,\n    `Node: ${nodeName}`,\n    `Waktu: ${occurredAt}`,\n    `Business Key: ${businessKey}`,\n    `Error: ${errorMessage}`,\n    `Execution ID: ${execution.id ?? \"N/A\"}`\n  ].join(\"\\n\");\n\n  return {\n    json: {\n      workflow_name: workflowName,\n      node_name: nodeName,\n      occurred_at: occurredAt,\n      business_key: businessKey,\n      error_message: errorMessage,\n      execution_id: execution.id ?? null,\n      alert_message: message\n    }\n  };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        0
+      ],
+      "id": "16a5d723-4a6a-43dd-8c96-027dd5632713",
+      "name": "Susun Pesan Alert"
+    },
+    {
+      "parameters": {
+        "chatId": "1035938312",
+        "text": "=\n{{ $json.alert_message }}\n",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        448,
+        0
+      ],
+      "id": "de1d0805-432f-4240-a9df-e510d0d72175",
+      "name": "Kirim Alert Telegram",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "telegramApi": {
+          "name": "H8Mart Ops · Telegram API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://mock-api:8080/notify",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "=\n{{ JSON.stringify({\n  channel: \"ops-error\",\n  title: \"H8Mart - Workflow Error\",\n  text: $('Susun Pesan Alert').first().json.alert_message\n}) }}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        672,
+        0
+      ],
+      "id": "2a99b22d-6fe7-4854-ad2f-bb39fade98c4",
+      "name": "Kirim Alert Notification",
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "H8Mart · Mock API Header Auth"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Tangkap Error Workflow": {
+      "main": [
+        [
+          {
+            "node": "Susun Pesan Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Susun Pesan Alert": {
+      "main": [
+        [
+          {
+            "node": "Kirim Alert Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Kirim Alert Telegram": {
+      "main": [
+        [
+          {
+            "node": "Kirim Alert Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "timezone": "Asia/Jakarta",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "pinData": {}
+}

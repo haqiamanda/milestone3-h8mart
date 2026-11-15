@@ -1,0 +1,1189 @@
+{
+  "name": "WF1 · Stock Sync, Order Intake & Daily Digest",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        0
+      ],
+      "id": "fd8afe3c-a5bd-49fb-aa56-9028f97ee1e2",
+      "name": "Jadwal Sinkron 15 Menit",
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nSELECT\n    merchant_id,\n    name,\n    zone,\n    merchant_type\nFROM core.merchants\nWHERE active = TRUE\nORDER BY merchant_id;\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        224,
+        0
+      ],
+      "id": "78a73af7-d607-49d5-babf-f888f1be17f7",
+      "name": "Ambil Daftar Merchant",
+      "credentials": {
+        "postgres": {
+          "name": "H8Mart · PostgreSQL Ops Writer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        448,
+        0
+      ],
+      "id": "256830e5-438b-48dd-aa65-d739bef1e06e",
+      "name": "Loop Per Merchant"
+    },
+    {
+      "parameters": {
+        "url": "=http://mock-api:8080/merchants/{{ $json.merchant_id }}/stock",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        624,
+        224
+      ],
+      "id": "f6440712-9fc9-467e-ba00-80ed3db567f7",
+      "name": "Ambil Stok Merchant API",
+      "retryOnFail": true,
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "H8Mart · Mock API Header Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst rows = [];\n\nfor (const item of $input.all()) {\n  const data = item.json;\n\n  if (!data.merchant_id || !Array.isArray(data.items)) {\n    continue;\n  }\n\n  for (const product of data.items) {\n    rows.push({\n      json: {\n        merchant_id: data.merchant_id,\n        sku: String(product.sku).toUpperCase(),\n        qty: Number(product.qty),\n        synced_at: data.as_of\n      }\n    });\n  }\n}\n\n// Jika tidak ada stok yang berhasil dinormalisasi,\n// keluarkan satu item penanda agar IF tetap berjalan.\nif (rows.length === 0) {\n  return [\n    {\n      json: {\n        sync_empty: true,\n        reason: \"Tidak ada baris stok yang berhasil dinormalisasi\"\n      }\n    }\n  ];\n}\n\nreturn rows;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        640
+      ],
+      "id": "2dc4024f-ff23-4118-83d6-30e71eb3261a",
+      "name": "Normalisasi Stok"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nINSERT INTO ops.dead_letter (\n    workflow,\n    node,\n    execution_id,\n    business_key,\n    error_message,\n    payload,\n    attempts,\n    status\n)\nVALUES (\n    'WF1 · Stock Sync, Order Intake & Daily Digest',\n    'Ambil Stok Merchant API',\n    $1::text,\n    $2::text,\n    $3::text,\n    jsonb_build_object('merchant_id', $2::text),\n    3,\n    'open'\n)\nRETURNING id, business_key, error_message, status;\n",
+        "options": {
+          "queryReplacement": "=\n{{ [\n  String($execution.id ?? ''),\n  $('Loop Per Merchant').item.json.merchant_id,\n  $json.error?.message ?? $json.message ?? 'Merchant Stock API gagal setelah retry'\n] }}\n"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        896,
+        304
+      ],
+      "id": "73c1c652-bf0d-4f67-b4b1-a815f6b4539b",
+      "name": "Catat Dead-Letter",
+      "credentials": {
+        "postgres": {
+          "name": "H8Mart · PostgreSQL Ops Writer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://mock-api:8080/notify",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "=\n{{ JSON.stringify({\n  channel: \"ops-alerts\",\n  title: \"H8Mart - Merchant Stock Sync Failed\",\n  text: \"Gagal sinkronisasi stok merchant \" +\n    $json.business_key +\n    \". Error: \" +\n    $json.error_message\n}) }}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1120,
+        304
+      ],
+      "id": "5e934840-039a-49f0-8792-ffd305d121d3",
+      "name": "Alert Merchant Gagal",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "H8Mart · Mock API Header Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 4
+          },
+          "conditions": [
+            {
+              "id": "11893f7e-fc66-40df-b908-122272bfc207",
+              "leftValue": "={{ $json.merchant_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.4,
+      "position": [
+        224,
+        640
+      ],
+      "id": "89809de5-4319-401f-b89b-c18b6b455bf2",
+      "name": "Ada Baris Stok?"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nSELECT\n    product_id,\n    sku,\n    name\nFROM core.products\nORDER BY product_id;\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        480,
+        512
+      ],
+      "id": "8a9f7f15-f090-4e79-851a-6f12df56ca0f",
+      "name": "Ambil Katalog Produk",
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "name": "H8Mart · PostgreSQL Ops Writer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "fieldsToMatchString": "sku",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        896,
+        640
+      ],
+      "id": "e39c3bdb-e8cd-4a7d-a803-03fd7590c698",
+      "name": "Gabungkan Katalog"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nWITH previous_stock AS MATERIALIZED (\n    SELECT qty AS old_qty\n    FROM core.merchant_stock\n    WHERE merchant_id = $1::TEXT\n      AND product_id = $2::TEXT\n),\nupdated_stock AS (\n    INSERT INTO core.merchant_stock (\n        merchant_id,\n        product_id,\n        qty,\n        synced_at\n    )\n    VALUES (\n        $1::TEXT,\n        $2::TEXT,\n        $3::INTEGER,\n        $4::TIMESTAMPTZ\n    )\n    ON CONFLICT (merchant_id, product_id)\n    DO UPDATE SET\n        qty = EXCLUDED.qty,\n        synced_at = EXCLUDED.synced_at\n    RETURNING merchant_id, product_id, qty, synced_at\n)\nSELECT\n    u.*,\n    (\n        COALESCE((SELECT old_qty FROM previous_stock), 0) > 0\n        AND u.qty = 0\n    ) AS is_new_stockout\nFROM updated_stock u;\n",
+        "options": {
+          "queryReplacement": "=\n{{ [\n  $json.merchant_id,\n  $json.product_id,\n  Number($json.qty),\n  $json.synced_at\n] }}\n"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1136,
+        640
+      ],
+      "id": "2094a8f5-5a70-4c95-b504-9b3515069e9c",
+      "name": "Upsert Stok",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "postgres": {
+          "name": "H8Mart · PostgreSQL Ops Writer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nINSERT INTO ops.sync_runs (\n    merchants_total,\n    merchants_ok,\n    rows_synced,\n    new_stockouts,\n    duration_ms\n)\nVALUES (\n    $1::INTEGER,\n    $2::INTEGER,\n    $3::INTEGER,\n    $5::INTEGER,\n    GREATEST(\n        0,\n        EXTRACT(EPOCH FROM (\n            NOW() - $4::TIMESTAMPTZ\n        )) * 1000\n    )::INTEGER\n)\nRETURNING *;\n",
+        "options": {
+          "queryReplacement": "=\n{{ [\n  $('Ambil Daftar Merchant').all().length,\n  new Set($('Normalisasi Stok').all().map(item => item.json.merchant_id)).size,\n  $('Normalisasi Stok').all().length,\n  $('Jadwal Sinkron 15 Menit').first().json.timestamp,\n  $('Upsert Stok').all().filter(item => item.json.is_new_stockout === true).length\n] }}\n"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        0,
+        1056
+      ],
+      "id": "748a038a-b905-483b-b00c-cead1c354534",
+      "name": "Catat Sync Run",
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "name": "H8Mart · PostgreSQL Ops Writer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 4
+          },
+          "conditions": [
+            {
+              "id": "a211e923-1995-41c5-a74e-f9f80eb8cb10",
+              "leftValue": "={{ $json.duration_ms }}",
+              "rightValue": 30000,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.4,
+      "position": [
+        224,
+        1056
+      ],
+      "id": "09c7cc52-09c1-4db4-a7c8-fca9c19804e2",
+      "name": "Terlalu Lambat?"
+    },
+    {
+      "parameters": {
+        "chatId": "1035938312",
+        "text": "=\n{{ [\n  '⚠️ H8MART — SINKRONISASI LAMBAT',\n  '',\n  'Run ID: ' + $json.run_id,\n  'Durasi: ' + (Number($json.duration_ms) / 1000).toFixed(2) + ' detik',\n  'Merchant berhasil: ' + $json.merchants_ok + '/' + $json.merchants_total,\n  'Stok tersinkron: ' + $json.rows_synced + ' baris',\n  '',\n  'Batas waktu sinkronisasi: 30 detik.'\n].join('\\n') }}\n",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        528,
+        944
+      ],
+      "id": "77864dcd-2a2c-484e-bedf-f2c45705311f",
+      "name": "Alert Perlambatan",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "telegramApi": {
+          "name": "H8Mart Ops · Telegram API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "={{ 'http://uptime-kuma:3001/api/push/ISI_TOKEN_PUSH_KUMA?status='\n   + (Number($('Catat Sync Run').first().json.merchants_ok)\n      === Number($('Catat Sync Run').first().json.merchants_total)\n      ? 'up' : 'down')\n   + '&msg=WF1%20Stock%20Sync'\n}}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        752,
+        1072
+      ],
+      "id": "3960e53b-9d15-453b-92eb-a5b88f9c8bb4",
+      "name": "Heartbeat Uptime Kuma",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 4
+          },
+          "conditions": [
+            {
+              "id": "7e8f3e83-2ca0-4355-b14e-e5392b494059",
+              "leftValue": "={{ $('Catat Sync Run').first().json.new_stockouts }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.4,
+      "position": [
+        944,
+        1072
+      ],
+      "id": "5a104cf6-1b26-4704-bbf7-3d074cc25ef2",
+      "name": "Ada Produk Habis Baru?"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://mock-api:8080/notify",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "=\n{{ JSON.stringify({\n  channel: \"ops-alerts\",\n  title: \"H8Mart - New Stockout Alert\",\n  text: \"Terdeteksi \" +\n    $('Catat Sync Run').first().json.new_stockouts +\n    \" produk baru kehabisan stok pada sinkronisasi terakhir. \" +\n    \"Segera periksa ketersediaan stok merchant.\"\n}) }}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1168,
+        976
+      ],
+      "id": "7baf5d59-90f2-4c86-9ba8-e3a351e1335f",
+      "name": "Laporkan Produk Habis",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "H8Mart · Mock API Header Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "errorMessage": "Tidak ada baris stok valid untuk diproses"
+      },
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        480,
+        688
+      ],
+      "id": "b070bbf3-a981-43c0-935d-5cc9079ef7eb",
+      "name": "Stop - Tidak Ada Stok"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "order.created",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.2,
+      "position": [
+        1648,
+        16
+      ],
+      "id": "d79b1613-f6bb-40f5-a540-c6c89c51cb14",
+      "name": "Webhook Order Created",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "H8Mart · Webhook Header Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 4
+          },
+          "conditions": [
+            {
+              "id": "ee385b96-d1a3-456b-a874-8dc5a1b867e6",
+              "leftValue": "=\n{{ (() => { const b = $json.body ?? {}; const filled = v => typeof v === 'string' && v.trim().length > 0; return b.event === 'order.created' && filled(b.order_id) && filled(b.customer_id) && filled(b.merchant_id) && b.total_amount != null && b.total_amount !== '' && Number.isFinite(Number(b.total_amount)) && Number(b.total_amount) >= 0 && Array.isArray(b.items) && b.items.length > 0 && b.items.every(i => i && filled(i.sku) && Number.isInteger(i.qty) && i.qty > 0) && new Set(b.items.map(i => i.sku.trim().toUpperCase())).size === b.items.length ? 'VALID' : 'INVALID'; })() }}\n",
+              "rightValue": "^\\s*VALID\\s*$",
+              "operator": {
+                "type": "string",
+                "operation": "regex"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.4,
+      "position": [
+        1872,
+        16
+      ],
+      "id": "6a670e8d-cd79-4690-892a-3d27a1359b31",
+      "name": "Event Valid?"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nWITH order_input AS (\n    SELECT $1::JSONB AS payload\n),\nrequested_items AS (\n    SELECT\n        UPPER(item->>'sku') AS sku,\n        (item->>'qty')::INTEGER AS requested_qty\n    FROM order_input,\n    jsonb_array_elements(payload->'items') AS item\n),\nstock_check AS (\n    SELECT\n        r.sku,\n        r.requested_qty,\n        p.product_id,\n        COALESCE(s.qty, 0) AS available_qty\n    FROM requested_items r\n    LEFT JOIN core.products p\n        ON UPPER(p.sku) = r.sku\n    LEFT JOIN core.merchant_stock s\n        ON s.product_id = p.product_id\n        AND s.merchant_id = $2::TEXT\n)\nSELECT\n    $3::TEXT AS order_id,\n    $2::TEXT AS merchant_id,\n    COUNT(*) AS total_items,\n    COUNT(*) FILTER (\n        WHERE product_id IS NULL\n           OR available_qty < requested_qty\n    ) AS insufficient_items,\n    CASE\n        WHEN COUNT(*) = 0 THEN 'invalid'\n        WHEN COUNT(*) FILTER (\n            WHERE product_id IS NULL\n               OR available_qty < requested_qty\n        ) > 0 THEN 'habis'\n        WHEN COUNT(*) FILTER (\n            WHERE available_qty - requested_qty <= 5\n        ) > 0 THEN 'tipis'\n        ELSE 'cukup'\n    END AS stock_status,\n    COALESCE(\n        jsonb_agg(\n            jsonb_build_object(\n                'sku', sku,\n                'requested_qty', requested_qty,\n                'available_qty', available_qty\n            )\n        ) FILTER (WHERE sku IS NOT NULL),\n        '[]'::jsonb\n    ) AS stock_details\nFROM stock_check;\n",
+        "options": {
+          "queryReplacement": "=\n{{ [\n  JSON.stringify($('Webhook Order Created').first().json.body),\n  $('Webhook Order Created').first().json.body.merchant_id,\n  $('Webhook Order Created').first().json.body.order_id\n] }}\n"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        2096,
+        -64
+      ],
+      "id": "45499d10-1676-40d6-a44d-7bbf61566c05",
+      "name": "Cek Stok Order",
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "name": "H8Mart · PostgreSQL Ops Writer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 4
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.stock_status }}",
+                    "rightValue": "cukup",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "9d160f8c-f4d7-4a17-b276-507513595fea"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Cukup"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 4
+                },
+                "conditions": [
+                  {
+                    "id": "4822c6de-c88c-4601-bee2-1138a588a839",
+                    "leftValue": "={{ $json.stock_status }}",
+                    "rightValue": "tipis",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Tipis"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 4
+                },
+                "conditions": [
+                  {
+                    "id": "07b780d2-5b1c-4222-a4f2-5da4650957e7",
+                    "leftValue": "={{ $json.stock_status }}",
+                    "rightValue": "habis",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Habis"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.5,
+      "position": [
+        2288,
+        -48
+      ],
+      "id": "999bafe0-b172-4bbe-855b-9316250e10d4",
+      "name": "Routing Stok"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nWITH payload AS (\n    SELECT $1::JSONB AS data\n),\ninserted_order AS (\n    INSERT INTO core.orders (\n        order_id,\n        customer_id,\n        merchant_id,\n        zone,\n        order_date,\n        created_at,\n        status,\n        cancel_reason,\n        total_amount,\n        payment_status,\n        customer_note\n    )\n    SELECT\n        p.data->>'order_id',\n        p.data->>'customer_id',\n        p.data->>'merchant_id',\n        m.zone,\n        (NOW() AT TIME ZONE 'Asia/Jakarta')::DATE,\n        NOW(),\n        'active',\n        NULL,\n        (p.data->>'total_amount')::NUMERIC,\n        'unpaid',\n        p.data->>'customer_note'\n    FROM payload p\n    JOIN core.merchants m\n      ON m.merchant_id = p.data->>'merchant_id'\n    ON CONFLICT (order_id) DO NOTHING\n    RETURNING order_id, status\n),\ninserted_items AS (\n    INSERT INTO core.order_items (\n        order_id,\n        product_id,\n        qty,\n        unit_price\n    )\n    SELECT\n        o.order_id,\n        prod.product_id,\n        (item.value->>'qty')::INTEGER,\n        prod.price\n    FROM inserted_order o\n    CROSS JOIN payload p\n    CROSS JOIN LATERAL\n        jsonb_array_elements(p.data->'items') AS item(value)\n    JOIN core.products prod\n      ON UPPER(prod.sku) = UPPER(item.value->>'sku')\n    ON CONFLICT (order_id, product_id) DO NOTHING\n    RETURNING product_id\n)\nSELECT\n    p.data->>'order_id' AS order_id,\n    COALESCE(\n        (SELECT status FROM inserted_order LIMIT 1),\n        (\n            SELECT status\n            FROM core.orders\n            WHERE order_id = p.data->>'order_id'\n        )\n    ) AS status,\n    EXISTS (\n        SELECT 1 FROM inserted_order\n    ) AS created,\n    NOT EXISTS (\n        SELECT 1 FROM inserted_order\n    ) AS already_exists,\n    (\n        SELECT COUNT(*)\n        FROM inserted_items\n    ) AS items_saved,\n    $2::TEXT AS stock_status\nFROM payload p;\n",
+        "options": {
+          "queryReplacement": "=\n{{ [\n  JSON.stringify($('Webhook Order Created').first().json.body),\n  $json.stock_status\n] }}\n"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        2544,
+        -112
+      ],
+      "id": "2e46e73c-4963-4732-bd14-23ef5f600622",
+      "name": "Catat Order",
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "name": "H8Mart · PostgreSQL Ops Writer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "=\n{{ JSON.stringify({\n  success: true,\n  order_id: $json.order_id,\n  status: $json.status,\n  stock_status: $json.stock_status,\n  created: $json.created,\n  already_exists: $json.already_exists,\n  message: $json.already_exists\n    ? \"Order sudah tercatat sebelumnya\"\n    : $json.stock_status === \"tipis\"\n      ? \"Order diterima dengan peringatan stok tipis\"\n      : \"Order berhasil diterima\"\n}) }}\n",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        2768,
+        -112
+      ],
+      "id": "d3ae728f-828a-452a-9077-26a64d47963b",
+      "name": "Respon 200 Diterima"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "=\n{{ JSON.stringify({\n  success: false,\n  order_id: $json.order_id,\n  stock_status: \"habis\",\n  message: \"Order ditolak karena stok tidak mencukupi\",\n  insufficient_items: Number($json.insufficient_items),\n  stock_details: $json.stock_details\n}) }}\n",
+        "options": {
+          "responseCode": 409
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        2720,
+        96
+      ],
+      "id": "eb9d17ec-031d-4bf0-9e2f-01d605ffed8f",
+      "name": "Respon 409 Stok Habis"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "=\n{{ JSON.stringify({\n  success: false,\n  order_id: $('Webhook Order Created').first().json.body?.order_id ?? null,\n  status: \"invalid\",\n  message: \"Event order.created tidak valid atau data order tidak lengkap\"\n}) }}\n",
+        "options": {
+          "responseCode": 422
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        2208,
+        272
+      ],
+      "id": "f735d917-85f1-4380-a781-92e28ccc9903",
+      "name": "Respon 422 Tidak Valid"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 7
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        1632,
+        640
+      ],
+      "id": "36539309-b282-4430-859b-5a606c32fb6a",
+      "name": "Jadwal Digest 07.00 WIB",
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nWITH tanggal_acuan AS (\n    SELECT hari_data_terakhir AS tanggal\n    FROM core.data_info\n    LIMIT 1\n),\norder_harian AS (\n    SELECT\n        o.order_id,\n        o.status,\n        d.actual_minutes\n    FROM core.orders o\n    LEFT JOIN core.deliveries d\n        ON d.order_id = o.order_id\n    CROSS JOIN tanggal_acuan t\n    WHERE o.order_date = t.tanggal\n),\nkpi AS (\n    SELECT\n        COUNT(*) AS total_orders,\n        COUNT(*) FILTER (\n            WHERE status = 'cancelled'\n        ) AS cancelled_orders,\n        COUNT(*) FILTER (\n            WHERE status = 'delivered'\n              AND actual_minutes IS NOT NULL\n        ) AS delivered_orders,\n        COUNT(*) FILTER (\n            WHERE status = 'delivered'\n              AND actual_minutes <= 30\n        ) AS on_time_orders\n    FROM order_harian\n)\nSELECT\n    t.tanggal AS tanggal_digest,\n    k.total_orders,\n    k.cancelled_orders,\n    ROUND(\n        100.0 * k.cancelled_orders /\n        NULLIF(k.total_orders, 0),\n        2\n    ) AS cancel_rate_pct,\n    k.delivered_orders,\n    k.on_time_orders,\n    ROUND(\n        100.0 * k.on_time_orders /\n        NULLIF(k.delivered_orders, 0),\n        2\n    ) AS sla_30m_pct\nFROM tanggal_acuan t\nCROSS JOIN kpi k;\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1856,
+        640
+      ],
+      "id": "23f6e3ab-9f8c-41e8-9e4f-88914778c4dd",
+      "name": "Hitung KPI Harian",
+      "credentials": {
+        "postgres": {
+          "name": "H8Mart · PostgreSQL Ops Writer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 4
+          },
+          "conditions": [
+            {
+              "id": "0e838f15-1eb8-4e62-a772-bde43e1a9906",
+              "leftValue": "={{ Number($json.total_orders) }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.4,
+      "position": [
+        2080,
+        640
+      ],
+      "id": "86c51b05-21e6-4871-9261-8a910e46e9fc",
+      "name": "Digest Kosong?"
+    },
+    {
+      "parameters": {
+        "errorMessage": "WF1 Daily Digest gagal: tidak ada order pada tanggal referensi data."
+      },
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        2304,
+        544
+      ],
+      "id": "001e233a-212b-4fe6-a155-a98c7c5814fd",
+      "name": "Gagal: Digest Kosong"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst kpi = $('Hitung KPI Harian').first().json;\nconst result = $input.first().json;\n\nlet reasons = result.alasan_batal ?? [];\n\nif (typeof reasons === 'string') {\n  try {\n    reasons = JSON.parse(reasons);\n  } catch {\n    reasons = [];\n  }\n}\n\nif (!Array.isArray(reasons)) {\n  reasons = [];\n}\n\nconst reasonsText = reasons.length\n  ? reasons.map((r, i) =>\n      `${i + 1}. ${r.alasan_batal}: ${r.jumlah_pembatalan} order`\n    ).join('\\n')\n  : 'Tidak ada pembatalan tercatat.';\n\nconst message = [\n  '📊 H8MART — DAILY OPS DIGEST',\n  '',\n  `Tanggal data: ${kpi.tanggal_digest}`,\n  `Total order: ${kpi.total_orders}`,\n  `Order dibatalkan: ${kpi.cancelled_orders}`,\n  `Cancellation rate: ${kpi.cancel_rate_pct ?? 0}%`,\n  `SLA ≤30 menit: ${kpi.sla_30m_pct ?? 0}%`,\n  '',\n  '🔎 Alasan pembatalan — Seluruh Merchant:',\n  reasonsText,\n  '',\n  'Sumber: PostgreSQL H8Mart'\n].join('\\n');\n\nreturn [{\n  json: {\n    ...kpi,\n    merchant_id: 'ALL',\n    alasan_batal: reasons,\n    digest_message: message\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2528,
+        736
+      ],
+      "id": "f6acca47-ba96-4d99-9e94-4e203958bfd3",
+      "name": "Tambah Alasan ke Digest"
+    },
+    {
+      "parameters": {
+        "chatId": "1035938312",
+        "text": "=\n{{ $json.digest_message }}\n",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2752,
+        736
+      ],
+      "id": "0e8274fc-1458-40aa-a2b3-941adf9c4bff",
+      "name": "Kirim Digest Telegram",
+      "credentials": {
+        "telegramApi": {
+          "name": "H8Mart Ops · Telegram API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://mock-api:8080/notify",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "=\n{{ JSON.stringify({\n  channel: \"ops-digest\",\n  title: \"H8Mart - Daily Ops Digest\",\n  text: $('Tambah Alasan ke Digest').first().json.digest_message\n}) }}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        2976,
+        736
+      ],
+      "id": "1b5da8d5-fcab-4e22-a6c8-d47cfedabbd4",
+      "name": "Kirim Digest Notification",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "H8Mart · Mock API Header Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nWITH alasan AS (\n    SELECT\n        COALESCE(cancel_reason, 'tidak_diketahui') AS alasan_batal,\n        COUNT(*) AS jumlah_pembatalan\n    FROM core.orders\n    WHERE order_date = $1::DATE\n      AND status = 'cancelled'\n    GROUP BY COALESCE(cancel_reason, 'tidak_diketahui')\n    ORDER BY jumlah_pembatalan DESC, alasan_batal\n    LIMIT 5\n)\nSELECT\n    COALESCE(\n        jsonb_agg(\n            jsonb_build_object(\n                'alasan_batal', alasan_batal,\n                'jumlah_pembatalan', jumlah_pembatalan\n            )\n            ORDER BY jumlah_pembatalan DESC, alasan_batal\n        ),\n        '[]'::jsonb\n    ) AS alasan_batal\nFROM alasan;\n",
+        "options": {
+          "queryReplacement": "=\n{{ [ $('Hitung KPI Harian').first().json.tanggal_digest ] }}\n"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        2304,
+        736
+      ],
+      "id": "95837c84-5837-454f-b345-605b98cc3c7f",
+      "name": "Alasan Batal Teratas",
+      "credentials": {
+        "postgres": {
+          "name": "H8Mart · PostgreSQL Ops Writer"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Jadwal Sinkron 15 Menit": {
+      "main": [
+        [
+          {
+            "node": "Ambil Daftar Merchant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ambil Daftar Merchant": {
+      "main": [
+        [
+          {
+            "node": "Loop Per Merchant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Per Merchant": {
+      "main": [
+        [
+          {
+            "node": "Normalisasi Stok",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ambil Stok Merchant API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ambil Stok Merchant API": {
+      "main": [
+        [
+          {
+            "node": "Loop Per Merchant",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Catat Dead-Letter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Catat Dead-Letter": {
+      "main": [
+        [
+          {
+            "node": "Alert Merchant Gagal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Merchant Gagal": {
+      "main": [
+        [
+          {
+            "node": "Loop Per Merchant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalisasi Stok": {
+      "main": [
+        [
+          {
+            "node": "Ada Baris Stok?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ada Baris Stok?": {
+      "main": [
+        [
+          {
+            "node": "Ambil Katalog Produk",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Gabungkan Katalog",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Stop - Tidak Ada Stok",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ambil Katalog Produk": {
+      "main": [
+        [
+          {
+            "node": "Gabungkan Katalog",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Gabungkan Katalog": {
+      "main": [
+        [
+          {
+            "node": "Upsert Stok",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Stok": {
+      "main": [
+        [
+          {
+            "node": "Catat Sync Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Catat Sync Run": {
+      "main": [
+        [
+          {
+            "node": "Terlalu Lambat?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Terlalu Lambat?": {
+      "main": [
+        [
+          {
+            "node": "Alert Perlambatan",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Heartbeat Uptime Kuma",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Heartbeat Uptime Kuma": {
+      "main": [
+        [
+          {
+            "node": "Ada Produk Habis Baru?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ada Produk Habis Baru?": {
+      "main": [
+        [
+          {
+            "node": "Laporkan Produk Habis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Order Created": {
+      "main": [
+        [
+          {
+            "node": "Event Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Event Valid?": {
+      "main": [
+        [
+          {
+            "node": "Cek Stok Order",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respon 422 Tidak Valid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cek Stok Order": {
+      "main": [
+        [
+          {
+            "node": "Routing Stok",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Routing Stok": {
+      "main": [
+        [
+          {
+            "node": "Catat Order",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Catat Order",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respon 409 Stok Habis",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respon 422 Tidak Valid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Catat Order": {
+      "main": [
+        [
+          {
+            "node": "Respon 200 Diterima",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Jadwal Digest 07.00 WIB": {
+      "main": [
+        [
+          {
+            "node": "Hitung KPI Harian",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hitung KPI Harian": {
+      "main": [
+        [
+          {
+            "node": "Digest Kosong?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Digest Kosong?": {
+      "main": [
+        [
+          {
+            "node": "Gagal: Digest Kosong",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Alasan Batal Teratas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tambah Alasan ke Digest": {
+      "main": [
+        [
+          {
+            "node": "Kirim Digest Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Kirim Digest Telegram": {
+      "main": [
+        [
+          {
+            "node": "Kirim Digest Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Perlambatan": {
+      "main": [
+        [
+          {
+            "node": "Heartbeat Uptime Kuma",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alasan Batal Teratas": {
+      "main": [
+        [
+          {
+            "node": "Tambah Alasan ke Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "timezone": "Asia/Jakarta",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false,
+    "errorWorkflow": "nZk4gmJDCn91nBOc"
+  },
+  "pinData": {}
+}

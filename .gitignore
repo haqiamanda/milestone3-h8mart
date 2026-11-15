@@ -1,0 +1,35 @@
+
+# Environment & credentials
+.env
+.env.*
+!.env.example
+credentials*.json
+*.pem
+*.key
+
+# Dependencies
+node_modules/
+
+# Local persistent data
+n8n_data/
+postgres_data/
+kuma_data/
+
+# Private backups & databases
+backup/
+backups/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.dump
+*.bak
+*.backup
+n8n-config
+
+# Logs & temporary files
+*.log
+.DS_Store
+h8mart-aws-import.json
+h8mart-latest-workflows.json
+h8mart-submission-workflows.tar.gz

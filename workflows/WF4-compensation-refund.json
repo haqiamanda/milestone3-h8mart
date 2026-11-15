@@ -1,0 +1,980 @@
+{
+  "name": "WF4 · Compensation & Refund",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "compensation-event",
+        "authentication": "headerAuth",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        -128
+      ],
+      "id": "0f3d665e-5e29-438d-b1bc-e3c639ca6ca6",
+      "name": "Terima Event Kompensasi",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "H8Mart · Webhook Header Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nSELECT\n    o.order_id,\n    o.merchant_id,\n    o.customer_id,\n    o.status,\n    o.payment_status,\n    o.total_amount,\n    o.order_date\nFROM core.orders AS o\nWHERE o.order_id = $1::TEXT\nLIMIT 1;\n",
+        "options": {
+          "queryReplacement": "=\n{{ [\n  $('Terima Event Kompensasi').first().json.body.order_id\n] }}\n"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        208,
+        -128
+      ],
+      "id": "5b85098f-b14a-4d64-a075-1d671ceb3432",
+      "name": "Ambil Order",
+      "credentials": {
+        "postgres": {
+          "name": "H8Mart · PostgreSQL Ops Writer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst event = $('Terima Event Kompensasi').first().json.body;\n\nreturn $input.all().map(item => {\n  const order = item.json;\n\n  const eventType = event.event;\n  const minutesLate = Number(event.minutes_late ?? 0);\n  const totalAmount = Number(order.total_amount ?? 0);\n\n  let action = \"invalid\";\n  let amount = 0;\n  let requiresApproval = false;\n  let reason = \"\";\n\n  if (eventType === \"delivery.late\") {\n    if (Number.isFinite(minutesLate) && minutesLate > 0) {\n      action = \"voucher\";\n      amount = minutesLate <= 15 ? 5000 : 10000;\n      reason = \"Kompensasi keterlambatan pengiriman\";\n    } else {\n      reason = \"Durasi keterlambatan tidak valid\";\n    }\n  } else if (eventType === \"order.failed\") {\n    if (order.payment_status === \"captured\" && totalAmount > 0) {\n      action = \"refund\";\n      amount = totalAmount;\n      requiresApproval = amount > 50000;\n      reason = \"Refund order gagal dengan pembayaran captured\";\n    } else {\n      action = \"no_refund\";\n      reason = \"Pembayaran belum captured atau nominal tidak valid\";\n    }\n  } else {\n    reason = \"Jenis event tidak dikenal\";\n  }\n\n  return {\n    json: {\n      ...order,\n      event_type: eventType,\n      minutes_late: minutesLate,\n      action,\n      amount,\n      requires_approval: requiresApproval,\n      reason\n    }\n  };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        -128
+      ],
+      "id": "884dd900-17ca-4a50-a46d-63aaa6cd1706",
+      "name": "Tentukan Kebijakan"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 4
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "voucher",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "c341cdd0-90cb-4612-99b5-de181cceec15"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Voucher"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 4
+                },
+                "conditions": [
+                  {
+                    "id": "bdfea9db-d1b3-4d2e-997c-62d1054e8031",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "refund",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Refund"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.5,
+      "position": [
+        640,
+        -144
+      ],
+      "id": "4034f8be-0dfd-4132-8f50-e35fb0105ec4",
+      "name": "Jenis Event?"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nWITH attempt AS (\n    INSERT INTO ops.compensations (\n        order_id,\n        kind,\n        amount,\n        idempotency_key,\n        status\n    )\n    VALUES (\n        $1::TEXT,\n        'voucher',\n        $2::NUMERIC,\n        'voucher:' || $1::TEXT,\n        'pending'\n    )\n    ON CONFLICT (idempotency_key) DO NOTHING\n    RETURNING *\n)\nSELECT\n    attempt.*,\n    TRUE AS newly_created\nFROM attempt\n\nUNION ALL\n\nSELECT\n    c.*,\n    FALSE AS newly_created\nFROM ops.compensations c\nWHERE c.idempotency_key = 'voucher:' || $1::TEXT\n  AND NOT EXISTS (SELECT 1 FROM attempt);\n",
+        "options": {
+          "queryReplacement": "=\n{{ [\n  $json.order_id,\n  $json.amount\n] }}\n"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        16,
+        192
+      ],
+      "id": "3fe43a06-7684-44fd-9ff2-94a9bf154e38",
+      "name": "Catat Voucher",
+      "credentials": {
+        "postgres": {
+          "name": "H8Mart · PostgreSQL Ops Writer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 4
+          },
+          "conditions": [
+            {
+              "id": "472770e1-61c5-440e-afc0-f43693ff7fba",
+              "leftValue": "=\n{{ $json.newly_created === true ? 'BARU' : 'DUPLIKAT' }}\n",
+              "rightValue": "^\\s*BARU\\s*$",
+              "operator": {
+                "type": "string",
+                "operation": "regex"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.4,
+      "position": [
+        240,
+        192
+      ],
+      "id": "568b0ff9-7b52-4851-92ff-6a64c62c539b",
+      "name": "Voucher Baru?"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://mock-api:8080/payments/vouchers",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Idempotency-Key",
+              "value": "={{ $json.idempotency_key }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "=\n{{ JSON.stringify({\n  order_id: $json.order_id,\n  amount: Number($json.amount)\n}) }}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        544,
+        176
+      ],
+      "id": "94df974c-f8b0-4a7b-a051-38ce02f08d01",
+      "name": "Panggil Payment Voucher",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "H8Mart · Mock API Header Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nUPDATE ops.compensations\nSET\n    status = 'issued',\n    payment_ref = $2::TEXT,\n    updated_at = NOW()\nWHERE idempotency_key = $1::TEXT\n  AND status = 'pending'\nRETURNING *;\n",
+        "options": {
+          "queryReplacement": "=\n{{ [\n  $('Voucher Baru?').first().json.idempotency_key,\n  $json.voucher_id\n] }}\n"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        768,
+        176
+      ],
+      "id": "a6a26872-7457-40c7-b35c-fba906bf71dd",
+      "name": "Catat Voucher Terbit",
+      "credentials": {
+        "postgres": {
+          "name": "H8Mart · PostgreSQL Ops Writer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://mock-api:8080/notify",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "=\n{{ JSON.stringify({\n  channel: \"merchant-ops\",\n  title: \"H8Mart - Voucher Kompensasi\",\n  text: `Voucher kompensasi sebesar Rp${Number($json.amount).toLocaleString('id-ID')} untuk order ${$json.order_id} telah diterbitkan. Referensi: ${$json.payment_ref}.`\n}) }}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        992,
+        176
+      ],
+      "id": "42aaca02-6fcb-4438-9011-814b0e0e01c3",
+      "name": "Notifikasi Voucher",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "H8Mart · Mock API Header Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nWITH attempt AS (\n    INSERT INTO ops.refund_actions (\n        order_id,\n        idempotency_key,\n        amount,\n        status\n    )\n    VALUES (\n        $1::TEXT,\n        'refund:' || $1::TEXT,\n        $2::NUMERIC,\n        CASE\n            WHEN $3::BOOLEAN\n            THEN 'pending_approval'\n            ELSE 'approved'\n        END\n    )\n    ON CONFLICT (idempotency_key) DO NOTHING\n    RETURNING *\n)\nSELECT\n    attempt.*,\n    TRUE AS newly_created\nFROM attempt\n\nUNION ALL\n\nSELECT\n    r.*,\n    FALSE AS newly_created\nFROM ops.refund_actions r\nWHERE r.idempotency_key = 'refund:' || $1::TEXT\n  AND NOT EXISTS (SELECT 1 FROM attempt);\n",
+        "options": {
+          "queryReplacement": "=\n{{ [\n  $json.order_id,\n  $json.amount,\n  $json.requires_approval\n] }}\n"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        0,
+        656
+      ],
+      "id": "deba7fd6-195e-42c8-be5a-81ac0f1cc0dc",
+      "name": "Catat Usulan Refund",
+      "credentials": {
+        "postgres": {
+          "name": "H8Mart · PostgreSQL Ops Writer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 4
+          },
+          "conditions": [
+            {
+              "id": "a3a205ed-68ae-4988-a630-44e6d942670f",
+              "leftValue": "=\n{{ $json.newly_created === true ? 'BARU' : 'DUPLIKAT' }}\n",
+              "rightValue": "^\\s*BARU\\s*$",
+              "operator": {
+                "type": "string",
+                "operation": "regex"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.4,
+      "position": [
+        224,
+        640
+      ],
+      "id": "664bb155-7877-41ae-985c-f9f1e872db69",
+      "name": "Refund Baru?"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 4
+          },
+          "conditions": [
+            {
+              "id": "ae5631cd-e239-42e7-8812-f6da1b46d995",
+              "leftValue": "=\n{{ Number($json.amount) > 50000 && $json.status === 'pending_approval' ? 'APPROVAL' : 'OTOMATIS' }}\n",
+              "rightValue": "^\\s*APPROVAL\\s*$",
+              "operator": {
+                "type": "string",
+                "operation": "regex"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.4,
+      "position": [
+        480,
+        608
+      ],
+      "id": "367dfb98-1ff3-4173-ac3f-31638508f3e0",
+      "name": "Perlu Approval?"
+    },
+    {
+      "parameters": {
+        "operation": "sendAndWait",
+        "chatId": "1035938312",
+        "message": "=\n{{ `🔐 PERMINTAAN APPROVAL REFUND — H8MART\n\nOrder ID: ${$json.order_id}\nNominal: Rp${Number($json.amount).toLocaleString('id-ID')}\n\nSilakan pilih Approve atau Reject.\n\nPastikan Order ID dan nominal sudah sesuai sebelum menyetujui.` }}\n",
+        "approvalOptions": {
+          "values": {
+            "approvalType": "double"
+          }
+        },
+        "chatApproval": true,
+        "approverIds": "1035938312",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        656,
+        416
+      ],
+      "id": "9685695f-e248-402c-b2cc-ff60faf43278",
+      "name": "Kirim Permintaan Approval Telegram",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "telegramApi": {
+          "name": "H8Mart Ops · Telegram API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst request = $('Catat Usulan Refund').first().json;\nconst incoming = $input.first().json;\n\nconst response = incoming.data ?? {};\n\nconst allowedOpsId = '1035938312';\n\nconst responderId = String(response.responder?.id ?? '');\nconst responderSource = String(response.responder?.source ?? '');\nconst chatId = String(response.chatId ?? '');\n\nconst validResponder =\n  responderId === allowedOpsId &&\n  chatId === allowedOpsId &&\n  responderSource === 'telegram';\n\nconst validDecision =\n  typeof response.approved === 'boolean';\n\nconst validRequest =\n  validResponder &&\n  validDecision &&\n  request.status === 'pending_approval' &&\n  request.newly_created === true;\n\nconst approved =\n  validRequest &&\n  response.approved === true;\n\nconst decision = !validRequest\n  ? 'invalid'\n  : approved\n    ? 'approve'\n    : 'reject';\n\nreturn [{\n  json: {\n    action_id: request.action_id,\n    order_id: request.order_id,\n    idempotency_key: request.idempotency_key,\n    amount: Number(request.amount),\n    original_status: request.status,\n    decision,\n    approved,\n    valid_request: validRequest,\n    approved_by: validRequest\n      ? `telegram:${responderId}`\n      : null,\n    responded_at: validRequest\n      ? response.respondedAt\n      : null,\n    reason: !validRequest\n      ? 'Keputusan atau identitas approver tidak valid'\n      : approved\n        ? 'Refund disetujui Ops melalui Telegram'\n        : 'Refund ditolak Ops melalui Telegram'\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        832,
+        416
+      ],
+      "id": "cca9dce0-3bfd-4a2f-8828-202a9f26d662",
+      "name": "Validasi Keputusan Ops"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nUPDATE ops.refund_actions\nSET\n    status = 'approved',\n    approved_by = $4::TEXT,\n    updated_at = NOW()\nWHERE action_id = $1::BIGINT\n  AND order_id = $2::TEXT\n  AND idempotency_key = $3::TEXT\n  AND status = 'pending_approval'\nRETURNING\n    action_id,\n    order_id,\n    idempotency_key,\n    amount,\n    status,\n    approved_by,\n    payment_ref;\n",
+        "options": {
+          "queryReplacement": "=\n{{ [\n  $json.action_id,\n  $json.order_id,\n  $json.idempotency_key,\n  $json.approved_by\n] }}\n"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1424,
+        352
+      ],
+      "id": "0816a60e-cced-452a-a1a2-55d9f630fef7",
+      "name": "Catat Approval Refund",
+      "credentials": {
+        "postgres": {
+          "name": "H8Mart · PostgreSQL Ops Writer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 4
+          },
+          "conditions": [
+            {
+              "id": "7de3245e-54db-4c1b-97c3-12e8df6cc42a",
+              "leftValue": "=\n{{ \n  $json.status === 'approved' &&\n  $json.approved_by === $('Validasi Keputusan Ops').first().json.approved_by &&\n  $('Validasi Keputusan Ops').first().json.valid_request === true &&\n  $('Validasi Keputusan Ops').first().json.approved === true &&\n  String($json.action_id) === String($('Validasi Keputusan Ops').first().json.action_id) &&\n  String($json.order_id) === String($('Validasi Keputusan Ops').first().json.order_id) &&\n  String($json.idempotency_key) === String($('Validasi Keputusan Ops').first().json.idempotency_key) &&\n  Boolean($json.idempotency_key) &&\n  Number($json.amount) > 0\n}}\n",
+              "rightValue": " ^\\s*VALID\\s*$",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.4,
+      "position": [
+        1664,
+        352
+      ],
+      "id": "75daecf0-d89e-4bcf-b35d-686fb3147ca5",
+      "name": "Approval Tercatat?"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://mock-api:8080/payments/refunds",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Idempotency-Key",
+              "value": "={{ $json.idempotency_key }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "=\n{{ JSON.stringify({\n  order_id: $json.order_id,\n  amount: Number($json.amount)\n}) }}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1664,
+        624
+      ],
+      "id": "b1844b06-9ed1-413d-9777-136f060656b6",
+      "name": "Panggil Payment Refund",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "H8Mart · Mock API Header Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nUPDATE ops.refund_actions\nSET\n    status = 'refunded',\n    payment_ref = $2::TEXT,\n    updated_at = NOW()\nWHERE idempotency_key = $1::TEXT\n  AND status = 'approved'\n  AND $3::TEXT = 'succeeded'\n  AND order_id = $4::TEXT\n  AND amount = $5::NUMERIC\n  AND NULLIF($2::TEXT, '') IS NOT NULL\nRETURNING\n    action_id,\n    order_id,\n    idempotency_key,\n    amount,\n    status,\n    approved_by,\n    payment_ref,\n    updated_at;\n",
+        "options": {
+          "queryReplacement": "=\n{{ [\n  $('Catat Usulan Refund').first().json.idempotency_key,\n  $json.refund_id,\n  $json.status,\n  $json.order_id,\n  $json.amount\n] }}\n"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1888,
+        528
+      ],
+      "id": "0f851add-a6a9-412a-8cef-b48b77ad26ab",
+      "name": "Catat Refund Selesai",
+      "credentials": {
+        "postgres": {
+          "name": "H8Mart · PostgreSQL Ops Writer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://mock-api:8080/notify",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "=\n{{ JSON.stringify({\n  channel: \"merchant-ops\",\n  title: \"H8Mart - Refund Berhasil\",\n  text: `Refund sebesar Rp${Number($json.amount).toLocaleString('id-ID')} untuk order ${$json.order_id} telah berhasil diproses. Referensi: ${$json.payment_ref}. Status: ${$json.status}.`\n}) }}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        2080,
+        528
+      ],
+      "id": "f117ce36-4dae-4762-99d8-bea6ee41a7b9",
+      "name": "Notifikasi Refund",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "H8Mart · Mock API Header Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nUPDATE ops.refund_actions\nSET\n    status = 'rejected',\n    approved_by = $3::TEXT,\n    note = 'Refund ditolak oleh Ops',\n    updated_at = NOW()\nWHERE action_id = $1::BIGINT\n  AND order_id = $2::TEXT\n  AND idempotency_key = $6::TEXT\n  AND status = 'pending_approval'\n  AND $3::TEXT IS NOT NULL\n  AND $4::BOOLEAN = TRUE\n  AND $5::TEXT = 'reject'\nRETURNING\n    action_id,\n    order_id,\n    idempotency_key,\n    amount,\n    status,\n    approved_by,\n    note,\n    updated_at;\n",
+        "options": {
+          "queryReplacement": "=\n{{ [\n  $json.action_id,\n  $json.order_id,\n  $json.approved_by,\n  $json.valid_request,\n  $json.decision,\n  $json.idempotency_key\n] }}\n"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1424,
+        512
+      ],
+      "id": "a55fc3c6-3f83-49ca-ac37-39bddb4be569",
+      "name": "Tandai Ditolak",
+      "credentials": {
+        "postgres": {
+          "name": "H8Mart · PostgreSQL Ops Writer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 4
+          },
+          "conditions": [
+            {
+              "id": "cb0043d3-5b67-457f-a523-8bcb6fd44339",
+              "leftValue": "={{ $json.approved }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "2bf1d316-d95d-47d8-8a1d-c6ee1c12d764",
+              "leftValue": "={{ $json.valid_request }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.4,
+      "position": [
+        1216,
+        400
+      ],
+      "id": "7fcca5a1-02f3-4cd2-998f-1d906cb760ad",
+      "name": "Disetujui?"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nINSERT INTO ops.dead_letter (\n    workflow,\n    node,\n    execution_id,\n    business_key,\n    error_message,\n    payload,\n    attempts,\n    status\n)\nVALUES (\n    'WF4 · Compensation & Refund',\n    'Panggil Payment Refund',\n    $1::TEXT,\n    $2::TEXT,\n    $3::TEXT,\n    $4::JSONB,\n    3,\n    'open'\n)\nRETURNING *;\n",
+        "options": {
+          "queryReplacement": "=\n{{ [\n  $execution.id ?? 'manual',\n  $('Catat Usulan Refund').first().json.order_id,\n  $json.error?.message ?? $json.message ?? 'Payment Refund gagal setelah retry',\n  JSON.stringify({\n    action_id: $('Catat Usulan Refund').first().json.action_id,\n    order_id: $('Catat Usulan Refund').first().json.order_id,\n    idempotency_key: $('Catat Usulan Refund').first().json.idempotency_key,\n    amount: Number($('Catat Usulan Refund').first().json.amount),\n    http_status: $json.error?.status ?? $json.error?.statusCode ?? null,\n    error_code: $json.error?.code ?? null,\n    payment_error: $json.error?.details ?? $json.details?.body ?? null\n  })\n] }}\n"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1888,
+        752
+      ],
+      "id": "cf4d590a-1c83-4612-9b0d-8b90e254dafd",
+      "name": "Catat Dead-Letter Refund",
+      "credentials": {
+        "postgres": {
+          "name": "H8Mart · PostgreSQL Ops Writer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nUPDATE ops.refund_actions\nSET\n    status = 'failed',\n    note = 'Payment Refund gagal dikonfirmasi setelah retry; wajib rekonsiliasi sebelum retry manual',\n    updated_at = NOW()\nWHERE order_id = $1::TEXT\n  AND idempotency_key = $2::TEXT\n  AND status = 'approved'\n  AND payment_ref IS NULL\nRETURNING\n    action_id,\n    order_id,\n    idempotency_key,\n    amount,\n    status,\n    approved_by,\n    payment_ref,\n    note,\n    updated_at;\n",
+        "options": {
+          "queryReplacement": "=\n{{ [\n  $('Catat Usulan Refund').first().json.order_id,\n  $('Catat Usulan Refund').first().json.idempotency_key\n] }}\n"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        2064,
+        752
+      ],
+      "id": "84f733bf-806c-43c9-ad2a-b3a9f07ed38f",
+      "name": "Tandai Refund Gagal",
+      "credentials": {
+        "postgres": {
+          "name": "H8Mart · PostgreSQL Ops Writer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "1035938312",
+        "text": "=\n{{ `ALERT H8MART - REFUND GAGAL\n\nOrder ID: ${$json.order_id}\nNominal: Rp${Number($json.amount).toLocaleString('id-ID')}\nStatus: ${$json.status}\nIdempotency Key: ${$json.idempotency_key}\n\nPayment Refund gagal setelah retry.\n\nKegagalan telah dicatat pada ops.dead_letter.\n\nTINDAKAN OPS:\nPeriksa Payment API dan lakukan rekonsiliasi sebelum retry.\n\nJangan membuat idempotency key baru untuk order yang sama.` }}\n",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2256,
+        752
+      ],
+      "id": "78a8354d-a5e1-4f54-8c27-e6b69f8cd9cf",
+      "name": "Alert Refund Gagal",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "telegramApi": {
+          "name": "H8Mart Ops · Telegram API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 4
+          },
+          "conditions": [
+            {
+              "id": "37bb4cf5-35a6-4197-ba90-1438590b8bec",
+              "leftValue": "={{ $json.valid_request }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.4,
+      "position": [
+        1008,
+        416
+      ],
+      "id": "396dcf8b-e280-455e-926a-5d01f8aecf5d",
+      "name": "Keputusan Valid?"
+    }
+  ],
+  "connections": {
+    "Terima Event Kompensasi": {
+      "main": [
+        [
+          {
+            "node": "Ambil Order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ambil Order": {
+      "main": [
+        [
+          {
+            "node": "Tentukan Kebijakan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tentukan Kebijakan": {
+      "main": [
+        [
+          {
+            "node": "Jenis Event?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Jenis Event?": {
+      "main": [
+        [
+          {
+            "node": "Catat Voucher",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Catat Usulan Refund",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Catat Voucher": {
+      "main": [
+        [
+          {
+            "node": "Voucher Baru?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Voucher Baru?": {
+      "main": [
+        [
+          {
+            "node": "Panggil Payment Voucher",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Panggil Payment Voucher": {
+      "main": [
+        [
+          {
+            "node": "Catat Voucher Terbit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Catat Voucher Terbit": {
+      "main": [
+        [
+          {
+            "node": "Notifikasi Voucher",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Catat Usulan Refund": {
+      "main": [
+        [
+          {
+            "node": "Refund Baru?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Refund Baru?": {
+      "main": [
+        [
+          {
+            "node": "Perlu Approval?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Perlu Approval?": {
+      "main": [
+        [
+          {
+            "node": "Kirim Permintaan Approval Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Panggil Payment Refund",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Kirim Permintaan Approval Telegram": {
+      "main": [
+        [
+          {
+            "node": "Validasi Keputusan Ops",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validasi Keputusan Ops": {
+      "main": [
+        [
+          {
+            "node": "Keputusan Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Catat Approval Refund": {
+      "main": [
+        [
+          {
+            "node": "Approval Tercatat?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approval Tercatat?": {
+      "main": [
+        [
+          {
+            "node": "Panggil Payment Refund",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Panggil Payment Refund": {
+      "main": [
+        [
+          {
+            "node": "Catat Refund Selesai",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Catat Dead-Letter Refund",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Catat Refund Selesai": {
+      "main": [
+        [
+          {
+            "node": "Notifikasi Refund",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Disetujui?": {
+      "main": [
+        [
+          {
+            "node": "Catat Approval Refund",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Tandai Ditolak",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Catat Dead-Letter Refund": {
+      "main": [
+        [
+          {
+            "node": "Tandai Refund Gagal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tandai Refund Gagal": {
+      "main": [
+        [
+          {
+            "node": "Alert Refund Gagal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Keputusan Valid?": {
+      "main": [
+        [
+          {
+            "node": "Disetujui?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "errorWorkflow": "nZk4gmJDCn91nBOc",
+    "timezone": "Asia/Jakarta",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "pinData": {}
+}
